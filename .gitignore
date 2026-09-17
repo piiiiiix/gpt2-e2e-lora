@@ -1,0 +1,16 @@
+.ipynb_checkpoints/
+__pycache__/
+*.pyc
+
+outputs/*
+!outputs/.gitkeep
+
+checkpoints/
+*.pt
+*.pth
+*.bin
+
+.idea/
+.vscode/
+
+.env

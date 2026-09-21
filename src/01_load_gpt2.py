@@ -41,3 +41,18 @@ with torch.no_grad():  # 不进行反向传播
 # 解码模型输出,跳过特殊token
 print("6. Generated text:")
 print(tokenizer.decode(outputs[0], skip_special_tokens = True))
+
+# 模型架构
+print("\n7. GPT-2 structure:")
+print(model)
+
+'''
+(c_attn): Conv1D(nf=2304, nx=768) Wq+Wv+Wk
+(c_proj): Conv1D(nf=768, nx=768) Wo
+nf 输出维度
+nx 输入维度
+
+此处维度指的是特征数量 不同于Axis
+
+
+'''

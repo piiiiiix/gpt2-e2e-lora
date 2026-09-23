@@ -1,4 +1,6 @@
-import torch
+import json
+import os
+
 from datasets import load_dataset
 from peft import LoraConfig, get_peft_model
 from transformers import (
@@ -144,8 +146,9 @@ learning_rate动态步长使用 schedule 策略，按照步数把 learning rate 
 '''
 
 # 10. 保存模型和tokenizer配置
-trainer.save_model("outputs/gpt2-e2e-lora/final")
-tokenizer.save_pretrained("outputs/gpt2-e2e-lora/final")
+save_dir = "outputs/gpt2-e2e-lora/final"
+trainer.save_model(save_dir)
+tokenizer.save_pretrained(save_dir)
 
 '''
 # 10. smoke test 测试
@@ -178,3 +181,15 @@ print(test_sample["target"])
 print("\nModel output:")
 print(tokenizer.decode(output[0], skip_special_tokens=True))
 '''
+
+# 11. 保存训练过程到日志
+log_path = os.path.join(save_dir, "train_log.json")
+with open(log_path, "w", encoding="utf-8") as f:
+    json.dump(
+        trainer.state.log_history,
+        f,
+        ensure_ascii=False,
+        indent=2,
+    )
+
+print(f"Training log saved to: {log_path}")

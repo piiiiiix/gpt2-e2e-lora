@@ -1,5 +1,5 @@
 import torch
-from transformers import AutoTokenizer , AutoModelForCausalLM
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 model_name = "openai-community/gpt2"
 

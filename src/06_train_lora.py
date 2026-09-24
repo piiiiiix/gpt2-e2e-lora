@@ -86,6 +86,9 @@ data_collator = DataCollatorForSeq2Seq(
 )
 
 # 7. 训练参数
+
+os.environ["TENSORBOARD_LOGGING_DIR"] = "outputs/gpt2-e2e-lora/tensorboard"
+
 training_args = TrainingArguments(
     # checkpoint、日志相关输出存放位置
     # output_dir="outputs/lora-smoke-test",
@@ -119,8 +122,18 @@ training_args = TrainingArguments(
     save_strategy= "epoch",
     save_total_limit= 2,
     
+    # 保存"最好"的模型，而不是最后的训练结果
+    load_best_model_at_end=True,
+    # "最好"的定义方式由eval_loss决定
+    metric_for_best_model="eval_loss",
+    # 越大越好填否
+    greater_is_better=False,
+    
     # 不发送训练日志到外部日志工具
-    report_to="none",
+    # report_to="none",
+    
+    # 训练日志记录到tensorboard
+    report_to="tensorboard",
 
     # 16位浮点混合精度训练
     fp16=True,

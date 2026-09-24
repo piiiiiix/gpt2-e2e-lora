@@ -87,7 +87,7 @@ data_collator = DataCollatorForSeq2Seq(
 
 # 7. 训练参数
 
-os.environ["TENSORBOARD_LOGGING_DIR"] = "outputs/gpt2-e2e-lora/tensorboard"
+os.environ["TENSORBOARD_LOGGING_DIR"] = "outputs/gpt2-e2e-lora/tensorboard/r4_attn_lr2e-4_best-eval_dirtest"
 
 training_args = TrainingArguments(
     # checkpoint、日志相关输出存放位置
@@ -159,7 +159,7 @@ learning_rate动态步长使用 schedule 策略，按照步数把 learning rate 
 '''
 
 # 10. 保存模型和tokenizer配置
-save_dir = "outputs/gpt2-e2e-lora/final"
+save_dir = "outputs/gpt2-e2e-lora/final/r4_attn_lr2e-4_best-eval_dirtest"
 trainer.save_model(save_dir)
 tokenizer.save_pretrained(save_dir)
 

@@ -1,10 +1,9 @@
 import torch
 from datasets import load_dataset
-from peft import PeftModel
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 model_name = "openai-community/gpt2"
-lora_path = "outputs/gpt2-e2e-lora/final/r4_attn_lr2e-4_best-eval_dirtest"
+ft_path = "outputs/gpt2-e2e-full-ft/final"
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -14,7 +13,7 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 # ============================================================
 
 # 直接加载我们训练结束时保存的 tokenizer 配置
-tokenizer = AutoTokenizer.from_pretrained(lora_path)
+tokenizer = AutoTokenizer.from_pretrained(ft_path)
 
 
 # ============================================================
@@ -27,20 +26,12 @@ baseline_model.eval()
 
 
 # ============================================================
-# 3. 加载 LoRA 模型
+# 3. 加载 ft 模型
 # ============================================================
 
-# LoRA 不是一个完整 GPT-2，所以先加载原始 GPT-2
-lora_base_model = AutoModelForCausalLM.from_pretrained(model_name)
-
-# 再把训练好的 LoRA adapter 挂上去
-lora_model = PeftModel.from_pretrained(
-    lora_base_model,
-    lora_path,
-)
-
-lora_model = lora_model.to(device)
-lora_model.eval()
+ft_model = AutoModelForCausalLM.from_pretrained(ft_path)
+ft_model = ft_model.to(device)
+ft_model.eval()
 
 
 # ============================================================
@@ -76,6 +67,7 @@ prompt_length = inputs["input_ids"].shape[1]
 # 6. 两个模型使用完全相同的生成设置
 # ============================================================
 
+
 def generate(model):
     with torch.no_grad():
         output = model.generate(
@@ -95,7 +87,7 @@ def generate(model):
 
 
 baseline_output = generate(baseline_model)
-lora_output = generate(lora_model)
+ft_output = generate(ft_model)
 
 
 # ============================================================
@@ -111,5 +103,5 @@ print(reference)
 print("\n=========== Baseline GPT-2 ==========\n")
 print(baseline_output)
 
-print("\n============ GPT-2 + LoRA ===========\n")
-print(lora_output)
+print("\n============ GPT-2 + ft ===========\n")
+print(ft_output)

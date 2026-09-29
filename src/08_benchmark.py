@@ -1,339 +1,240 @@
-import re
-from collections import defaultdict
+'''
+benchmark : BLEU、NIST、METEOR、ROUGE-L、CIDEr
+BLEU：主要看你的生成文本和参考答案之间，n-gram（连续词片段）重合得有多像。比如 reference 里有 near Raja Indian Cuisine，你的输出里也出现了类似连续词组，BLEU 就会涨。它还会综合 1-gram、2-gram、3-gram、4-gram，并对太短的输出做 brevity penalty（长度惩罚）。所以它本质上偏“字面重合度”。
 
+NIST：可以理解成 BLEU 的一个变体，但它会给信息量更大的 n-gram 更高权重。像 the restaurant is 这种到处都有的短语，价值不大；像 Raja Indian Cuisine 这种更稀有、更有区分度的词组，贡献更大。所以它比 BLEU 更强调“你有没有对上有信息量的表达”。
+
+METEOR：比 BLEU 更宽松一点，不只是死看完全一样的词，还会考虑词形变化、近义匹配、对齐情况。例如某些情况下 rated 和 rating，或者意义接近的词，比 BLEU 更容易得到部分匹配。它还会同时考虑 precision 和 recall，所以对“漏了很多 reference 内容”的情况也比较敏感。
+
+ROUGE-L：这里的 L 是 Longest Common Subsequence（最长公共子序列）。它看的是你生成文本和 reference 之间，能不能找到一条比较长、顺序一致的共同词序列。它不要求这些词必须连续，所以比 BLEU 的 n-gram 更宽松一些。你可以理解成：整体句子骨架和词序有多像。
+
+CIDEr：这个最有点“面向生成任务”的味道。它也是看 n-gram，但会给稀有、具有描述区分度的词组更高权重，而高频套话权重更低。最早大量用于 image captioning（图像描述），核心思想是：生成的描述是不是抓住了参考答案里真正有辨识度的信息，而不是只会说一些万能句。对 E2E 这种生成任务也挺合适。
+'''
+
+import torch
 from datasets import load_dataset
+from nltk.translate.meteor_score import meteor_score
+from nltk.translate.nist_score import corpus_nist
+from pycocoevalcap.bleu.bleu import Bleu
+from pycocoevalcap.cider.cider import Cider
+from pycocoevalcap.rouge.rouge import Rouge
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+# ============================================================
+# 0. 配置
+# ============================================================
+
+MODEL_NAME = "openai-community/gpt2"
+
+# 先在 validation 上确认评测链路
+SPLIT = "validation"
+
+MAX_NEW_TOKENS = 60
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+
+# ============================================================
+# 1. tokenizer + baseline GPT-2
+# ============================================================
+
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+tokenizer.pad_token = tokenizer.eos_token
+
+model = AutoModelForCausalLM.from_pretrained(MODEL_NAME)
+model = model.to(device)
+model.eval()  # 切换推理模式
+
+
+# ============================================================
+# 2. 加载 E2E
+# ============================================================
 
 dataset = load_dataset(
     "GEM/e2e_nlg",
     trust_remote_code=True,
 )
 
-sample = dataset["validation"][0]
-
-mr = sample["meaning_representation"]
+eval_dataset = dataset[SPLIT]
 
 
-def parse_mr(mr):
-    pairs = re.findall(r"([^,\[]+)\[([^\]]+)\]", mr)
+# ============================================================
+# 3. 逐条生成
+# ============================================================
 
-    result = {}
+predictions = []
+references = []
 
-    for slot, value in pairs:
-        slot = slot.strip()
-        value = value.strip()
+for i, sample in enumerate(eval_dataset):
 
-        result[slot] = value
+    mr = sample["meaning_representation"]
+    reference = sample["target"]
 
-    return result
+    prompt = f"MR: {mr}\nText:"
+
+    inputs = tokenizer(
+        prompt,
+        return_tensors="pt",  # 结果直接返回成 PyTorch Tensor
+    ).to(device)
+
+    prompt_length = inputs["input_ids"].shape[1]
+
+    with torch.no_grad():
+        output = model.generate(
+            **inputs,
+            max_new_tokens=MAX_NEW_TOKENS,
+            do_sample=False,
+            pad_token_id=tokenizer.eos_token_id,
+        )
+
+    # 只保留新生成的部分
+    generated_ids = output[0][prompt_length:]
+
+    prediction = tokenizer.decode(
+        generated_ids,
+        skip_special_tokens=True,
+    ).strip()  # .strip()删开头结尾空白字符
+
+    predictions.append(prediction)
+    references.append(reference)
+
+    if (i + 1) % 100 == 0:
+        print(f"Generated {i + 1}/{len(eval_dataset)}")
 
 
-parsed_mr = parse_mr(mr)
+# ============================================================
+# 4. 转换成 pycocoevalcap 所需格式
+# ============================================================
 
-print("Original MR:")
-print(mr)
+# 格式：
+# {
+#   0: ["reference sentence"],
+#   1: ["reference sentence"],
+# }
+#
+# prediction 同理，只不过每条只有一个生成结果
 
-print("\nParsed MR:")
-print(parsed_mr)
+gts = {
+    i: [references[i]]
+    for i in range(len(references))
+}
 
-slot_values = defaultdict(set)
-
-for split in ["train", "validation", "test"]:
-    for sample in dataset[split]:
-        parsed = parse_mr(sample["meaning_representation"])
-
-        for slot, value in parsed.items():
-            slot_values[slot].add(value)
-
-
-print("\n========== Slot Vocabulary ==========\n")
-
-for slot in sorted(slot_values.keys()):
-    print(f"{slot}:")
-    for value in sorted(slot_values[slot]):
-        print(f"  - {value}")
-    print()
-
-
-VALUE_PATTERNS = {
-    "area": {
-        "city centre": [
-            "city centre",
-            "city center",
-        ],
-        "riverside": [
-            "riverside",
-            "river side",
-        ],
-    },
-    "customer rating": {
-        "low": [
-            "low rating",
-            "low rated",
-            "poor rating",
-        ],
-        "average": [
-            "average rating",
-            "average rated",
-            "average customer rating",
-        ],
-        "high": [
-            "high rating",
-            "high rated",
-            "high customer rating",
-        ],
-        "1 out of 5": [
-            "1 out of 5",
-            "one out of five",
-            "1 star",
-            "one star",
-        ],
-        "3 out of 5": [
-            "3 out of 5",
-            "three out of five",
-            "3 star",
-            "3-star",
-            "three star",
-            "three-star",
-        ],
-        "5 out of 5": [
-            "5 out of 5",
-            "five out of five",
-            "5 star",
-            "5-star",
-            "five star",
-            "five-star",
-        ],
-    },
-    "eatType": {
-        "coffee shop": [
-            "coffee shop",
-        ],
-        "pub": [
-            "pub",
-        ],
-        "restaurant": [
-            "restaurant",
-        ],
-    },
-    "familyFriendly": {
-        "yes": [
-            "family friendly",
-            "family-friendly",
-            "suitable for families",
-        ],
-        "no": [
-            "not family friendly",
-            "not family-friendly",
-            "not suitable for families",
-        ],
-    },
-    "food": {
-        "Chinese": ["chinese"],
-        "English": ["english"],
-        "Fast food": ["fast food"],
-        "French": ["french"],
-        "Indian": ["indian"],
-        "Italian": ["italian"],
-        "Japanese": ["japanese"],
-    },
-    "priceRange": {
-        "cheap": [
-            "cheap",
-        ],
-        "high": [
-            "high priced",
-            "high-priced",
-            "expensive",
-        ],
-        "less than £20": [
-            "less than £20",
-            "under £20",
-            "below £20",
-        ],
-        "moderate": [
-            "moderate",
-            "moderately priced",
-        ],
-        "more than £30": [
-            "more than £30",
-            "over £30",
-            "above £30",
-        ],
-        "£20-25": [
-            "£20-25",
-            "£20 to £25",
-            "between £20 and £25",
-        ],
-    },
+res = {
+    i: [predictions[i]]
+    for i in range(len(predictions))
 }
 
 
-def normalize(text):
-    return text.lower().strip()
-
-
-def value_is_expressed(slot, value, output):
-    output = normalize(output)
-
-    # open-set entity
-    if slot in ["name", "near"]:
-        return normalize(value) in output
-
-    patterns = VALUE_PATTERNS.get(slot, {}).get(value, [])
-
-    return any(normalize(pattern) in output for pattern in patterns)
-
 # ============================================================
-# 检测模型输出实际表达了哪些 slot-value
+# 5. BLEU
 # ============================================================
 
-def detect_realized_slots(output):
-    output = normalize(output)
+bleu_scorer = Bleu(4)
+# Bleu(n) = 计算从 BLEU-1 一直到 BLEU-n
+# BLEU-4 本身也不是“只看 4-gram”。标准 BLEU-4 通常是把 1、2、3、4-gram 的 precision 一起综合，再乘 brevity penalty（长度惩罚）。
 
-    realized = {}
-
-    # 1. open-set slot：name / near
-    # 直接从数据集里已经统计好的实体值中查
-    for slot in ["name", "near"]:
-        detected = []
-
-        for value in slot_values[slot]:
-            if normalize(value) in output:
-                detected.append(value)
-
-        if detected:
-            realized[slot] = detected
-
-    # 2. closed-set categorical slot
-    for slot, value_patterns in VALUE_PATTERNS.items():
-        detected = []
-
-        # familyFriendly 有一个特殊问题：
-        # "not family friendly" 本身包含 "family friendly"
-        # 所以优先检测 no
-        if slot == "familyFriendly":
-            no_patterns = value_patterns["no"]
-
-            if any(normalize(p) in output for p in no_patterns):
-                realized[slot] = ["no"]
-                continue
-
-        for value, patterns in value_patterns.items():
-            if any(normalize(p) in output for p in patterns):
-                detected.append(value)
-
-        if detected:
-            realized[slot] = detected
-
-    return realized
-
-# ============================================================
-# 比较 MR 和模型实际表达内容
-# ============================================================
-
-def evaluate_one_sample(mr, output):
-    expected = parse_mr(mr)
-    realized = detect_realized_slots(output)
-
-    correct = {}
-    missing = {}
-    wrong = {}
-    added = {}
-
-    # 1. MR 本来要求表达的 slot
-    for slot, expected_value in expected.items():
-
-        # 完全没检测到这个 slot
-        if slot not in realized:
-            missing[slot] = expected_value
-            continue
-
-        detected_values = realized[slot]
-
-        # 检测到了正确值，而且没有冲突值
-        if (
-            expected_value in detected_values
-            and len(detected_values) == 1
-        ):
-            correct[slot] = expected_value
-
-        else:
-            wrong[slot] = {
-                "expected": expected_value,
-                "detected": detected_values,
-            }
-
-    # 2. MR 根本没有要求，但模型自己表达出来了
-    for slot, detected_values in realized.items():
-        if slot not in expected:
-            added[slot] = detected_values
-
-    return {
-        "correct": correct,
-        "missing": missing,
-        "wrong": wrong,
-        "added": added,
-    }
-
-# ============================================================
-# 转换成 Precision / Recall / F1 / SER
-# ============================================================
-
-def calculate_metrics(result):
-    tp = len(result["correct"])
-
-    # wrong 既意味着：
-    # 该说的正确事实没有忠实表达 -> FN
-    # 又表达了错误事实 -> FP
-    fn = len(result["missing"]) + len(result["wrong"])
-    fp = len(result["added"]) + len(result["wrong"])
-
-    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
-    recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-
-    if precision + recall > 0:
-        f1 = 2 * precision * recall / (precision + recall)
-    else:
-        f1 = 0.0
-
-    total_expected = tp + fn
-
-    ser = (
-        len(result["missing"])
-        + len(result["wrong"])
-        + len(result["added"])
-    ) / total_expected if total_expected > 0 else 0.0
-
-    return {
-        "precision": precision,
-        "recall": recall,
-        "f1": f1,
-        "slot_error_rate": ser,
-    }
-
-test_output = (
-    "The riverside restaurant near Raja Indian Cuisine "
-    "has a high rating and is family friendly."
+bleu_score, _ = bleu_scorer.compute_score(
+    gts,
+    res,
 )
 
-result = evaluate_one_sample(mr, test_output)
-metrics = calculate_metrics(result)
+# bleu_score 会返回 BLEU-1 ~ BLEU-4
+bleu1, bleu2, bleu3, bleu4 = bleu_score
 
-print("\n========== Evaluation ==========\n")
-print("Output:")
-print(test_output)
 
-print("\nCorrect:")
-print(result["correct"])
+# ============================================================
+# 6. ROUGE-L
+# ============================================================
 
-print("\nMissing:")
-print(result["missing"])
+rouge_scorer = Rouge()
 
-print("\nWrong:")
-print(result["wrong"])
+rouge_l, _ = rouge_scorer.compute_score(
+    gts,
+    res,
+)
 
-print("\nAdded:")
-print(result["added"])
 
-print("\nMetrics:")
-print(metrics)
+# ============================================================
+# 7. CIDEr
+# ============================================================
+
+cider_scorer = Cider()
+
+cider, _ = cider_scorer.compute_score(
+    gts,
+    res,
+)
+
+
+# ============================================================
+# 8. NIST
+# ============================================================
+
+# NIST 需要：
+#
+# references:
+# [
+#   [["reference", "tokens"]],
+#   [["another", "reference"]],
+# ]
+#
+# hypotheses:
+# [
+#   ["generated", "tokens"],
+#   ["another", "generated"]
+# ]
+
+nist_references = [
+    [reference.split()]
+    for reference in references
+]
+
+nist_hypotheses = [
+    prediction.split()
+    for prediction in predictions
+]
+
+nist = corpus_nist(
+    nist_references,
+    nist_hypotheses,
+    n=5,
+)
+
+
+# ============================================================
+# 9. METEOR
+# ============================================================
+
+meteor_scores = []
+
+for reference, prediction in zip(
+    references,
+    predictions,
+):
+    score = meteor_score(
+        [reference.split()],
+        prediction.split(),
+    )
+
+    meteor_scores.append(score)
+
+meteor = sum(meteor_scores) / len(meteor_scores)
+
+
+# ============================================================
+# 10. 输出结果
+# ============================================================
+
+print("\n===================================")
+print(f"Baseline GPT-2 Benchmark ({SPLIT})")
+print("===================================")
+
+print(f"BLEU-1   : {bleu1:.4f}")
+print(f"BLEU-2   : {bleu2:.4f}")
+print(f"BLEU-3   : {bleu3:.4f}")
+print(f"BLEU-4   : {bleu4:.4f}")
+
+print(f"NIST     : {nist:.4f}")
+print(f"METEOR   : {meteor:.4f}")
+print(f"ROUGE-L  : {rouge_l:.4f}")
+print(f"CIDEr    : {cider:.4f}")

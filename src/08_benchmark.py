@@ -1,4 +1,4 @@
-'''
+"""
 benchmark : BLEU、NIST、METEOR、ROUGE-L、CIDEr
 BLEU：主要看你的生成文本和参考答案之间，n-gram（连续词片段）重合得有多像。比如 reference 里有 near Raja Indian Cuisine，你的输出里也出现了类似连续词组，BLEU 就会涨。它还会综合 1-gram、2-gram、3-gram、4-gram，并对太短的输出做 brevity penalty（长度惩罚）。所以它本质上偏“字面重合度”。
 
@@ -8,11 +8,15 @@ METEOR：比 BLEU 更宽松一点，不只是死看完全一样的词，还会�
 
 ROUGE-L：这里的 L 是 Longest Common Subsequence（最长公共子序列）。它看的是你生成文本和 reference 之间，能不能找到一条比较长、顺序一致的共同词序列。它不要求这些词必须连续，所以比 BLEU 的 n-gram 更宽松一些。你可以理解成：整体句子骨架和词序有多像。
 
-CIDEr：这个最有点“面向生成任务”的味道。它也是看 n-gram，但会给稀有、具有描述区分度的词组更高权重，而高频套话权重更低。最早大量用于 image captioning（图像描述），核心思想是：生成的描述是不是抓住了参考答案里真正有辨识度的信息，而不是只会说一些万能句。对 E2E 这种生成任务也挺合适。
-'''
+CIDEr：先把 prediction 和 reference 都变成 TF-IDF 加权的 n-gram 向量，然后算余弦相似度。这个最有点“面向生成任务”的味道。它也是看 n-gram，但会给稀有、具有描述区分度的词组更高权重，而高频套话权重更低。最早大量用于 image captioning（图像描述），核心思想是：生成的描述是不是抓住了参考答案里真正有辨识度的信息，而不是只会说一些万能句。对 E2E 这种生成任务也挺合适。
+"""
 
+from pathlib import Path
+
+import nltk
 import torch
 from datasets import load_dataset
+from nltk.corpus import wordnet
 from nltk.translate.meteor_score import meteor_score
 from nltk.translate.nist_score import corpus_nist
 from pycocoevalcap.bleu.bleu import Bleu
@@ -23,6 +27,31 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 # ============================================================
 # 0. 配置
 # ============================================================
+
+def ensure_wordnet():
+    # Use the same directory for downloading and loading, regardless of IDE cwd.
+    data_dir = Path(__file__).resolve().parents[1] / "nltk_data"
+    nltk.data.path.insert(0, str(data_dir))
+    try:
+        wordnet.ensure_loaded()
+        return
+    except LookupError:
+        pass
+
+    data_dir.mkdir(parents=True, exist_ok=True)
+    if not nltk.download("wordnet", download_dir=str(data_dir), raise_on_error=True):
+        raise RuntimeError(f"WordNet download failed. Data directory: {data_dir}")
+    try:
+        wordnet.ensure_loaded()
+    except LookupError as exc:
+        raise RuntimeError(
+            f"WordNet is still unavailable after downloading to {data_dir}. "
+            "Check the downloader output and your network connection."
+        ) from exc
+
+
+# English METEOR needs WordNet; omw-1.4 is for multilingual lookups.
+ensure_wordnet()
 
 MODEL_NAME = "openai-community/gpt2"
 
@@ -55,7 +84,7 @@ dataset = load_dataset(
     trust_remote_code=True,
 )
 
-eval_dataset = dataset[SPLIT]
+eval_dataset = dataset[SPLIT].select(range(100))
 
 
 # ============================================================
@@ -114,15 +143,9 @@ for i, sample in enumerate(eval_dataset):
 #
 # prediction 同理，只不过每条只有一个生成结果
 
-gts = {
-    i: [references[i]]
-    for i in range(len(references))
-}
+gts = {i: [references[i]] for i in range(len(references))}
 
-res = {
-    i: [predictions[i]]
-    for i in range(len(predictions))
-}
+res = {i: [predictions[i]] for i in range(len(predictions))}
 
 
 # ============================================================
@@ -184,15 +207,26 @@ cider, _ = cider_scorer.compute_score(
 #   ["another", "generated"]
 # ]
 
-nist_references = [
-    [reference.split()]
-    for reference in references
+'''
+[
+    "The restaurant is good",
+    "It is near Raja"
 ]
+⬇️
+[
+    [
+        ["The", "restaurant", "is", "good"]
+    ],
+    [
+        ["It", "is", "near", "Raja"]
+    ]
+]
+'''
 
-nist_hypotheses = [
-    prediction.split()
-    for prediction in predictions
-]
+
+nist_references = [[reference.split()] for reference in references]
+
+nist_hypotheses = [prediction.split() for prediction in predictions]
 
 nist = corpus_nist(
     nist_references,
@@ -207,6 +241,7 @@ nist = corpus_nist(
 
 meteor_scores = []
 
+# for ... in zip() 多个可迭代对象一起遍历
 for reference, prediction in zip(
     references,
     predictions,

@@ -19,6 +19,7 @@ from datasets import load_dataset
 from nltk.corpus import wordnet
 from nltk.translate.meteor_score import meteor_score
 from nltk.translate.nist_score import corpus_nist
+from peft import PeftModel
 from pycocoevalcap.bleu.bleu import Bleu
 from pycocoevalcap.cider.cider import Cider
 from pycocoevalcap.rouge.rouge import Rouge
@@ -50,226 +51,123 @@ def ensure_wordnet():
         ) from exc
 
 
-# English METEOR needs WordNet; omw-1.4 is for multilingual lookups.
-ensure_wordnet()
-
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 MODEL_NAME = "openai-community/gpt2"
-
-# 先在 validation 上确认评测链路
+LORA_PATH = PROJECT_ROOT / "outputs/gpt2-e2e-lora/final/r4_attn_lr2e-4_best-eval_dirtest"
+FT_PATH = PROJECT_ROOT / "outputs/gpt2-e2e-full-ft/final"
 SPLIT = "validation"
-
+NUM_SAMPLES = 100
 MAX_NEW_TOKENS = 60
 
-device = "cuda" if torch.cuda.is_available() else "cpu"
+
+def benchmark(model, tokenizer, eval_dataset, *, model_name="Model", max_new_tokens=60):
+    """生成文本并计算指标，返回指标字典。"""
+    if len(eval_dataset) == 0:
+        raise ValueError("评测数据不能为空")
+    ensure_wordnet()
+    model.eval()
+    device = next(model.parameters()).device
+    predictions = []
+    references = []
+
+    for i, sample in enumerate(eval_dataset):
+        prompt = f"MR: {sample['meaning_representation']}\nText:"
+        inputs = tokenizer(prompt, return_tensors="pt").to(device)
+        prompt_length = inputs["input_ids"].shape[1]
+        with torch.no_grad():
+            output = model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+                pad_token_id=tokenizer.eos_token_id,
+            )
+        # 只保留新生成的文本，不包含 prompt。
+        prediction = tokenizer.decode(
+            output[0][prompt_length:], skip_special_tokens=True,
+        ).strip()
+        predictions.append(prediction)
+        references.append(sample["target"])
+        if (i + 1) % 100 == 0 or i + 1 == len(eval_dataset):
+            print(f"[{model_name}] Generated {i + 1}/{len(eval_dataset)}", flush=True)
+
+    # pycocoevalcap 要求每条 reference/prediction 放在列表中。
+    gts = {i: [reference] for i, reference in enumerate(references)}
+    res = {i: [prediction] for i, prediction in enumerate(predictions)}
+    bleu_scores, _ = Bleu(4).compute_score(gts, res)
+    rouge_l, _ = Rouge().compute_score(gts, res)
+    cider, _ = Cider().compute_score(gts, res)
+
+    nist_references = [[reference.split()] for reference in references]
+    nist_hypotheses = [prediction.split() for prediction in predictions]
+    nist = corpus_nist(nist_references, nist_hypotheses, n=5)
+    meteor = sum(
+        meteor_score([reference.split()], prediction.split())
+        for reference, prediction in zip(references, predictions)
+    ) / len(predictions)
+
+    return {
+        **{f"BLEU-{i + 1}": float(score) for i, score in enumerate(bleu_scores)},
+        "NIST": float(nist),
+        "METEOR": float(meteor),
+        "ROUGE-L": float(rouge_l),
+        "CIDEr": float(cider),
+    }
 
 
-# ============================================================
-# 1. tokenizer + baseline GPT-2
-# ============================================================
+def main():
+    if not (LORA_PATH / "adapter_config.json").is_file():
+        raise FileNotFoundError(f"找不到 LoRA adapter：{LORA_PATH}")
+    if not (FT_PATH / "config.json").is_file():
+        raise FileNotFoundError(f"找不到 full fine-tuning 模型：{FT_PATH}")
+    ensure_wordnet()
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    # GPT-2 和 LoRA 共用训练时保存的 tokenizer。
+    tokenizer = AutoTokenizer.from_pretrained(str(LORA_PATH))
+    tokenizer.pad_token = tokenizer.eos_token
+    dataset = load_dataset("GEM/e2e_nlg", trust_remote_code=True)
+    # 冒烟测试
+    # eval_dataset = dataset[SPLIT].select(range(min(NUM_SAMPLES, len(dataset[SPLIT]))))
 
-tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-tokenizer.pad_token = tokenizer.eos_token
+    eval_dataset = dataset[SPLIT]
 
-model = AutoModelForCausalLM.from_pretrained(MODEL_NAME)
-model = model.to(device)
-model.eval()  # 切换推理模式
+    baseline_model = AutoModelForCausalLM.from_pretrained(MODEL_NAME).to(device)
+    baseline_scores = benchmark(
+        baseline_model, tokenizer, eval_dataset,
+        model_name="GPT-2", max_new_tokens=MAX_NEW_TOKENS,
+    )
+    # 先释放 baseline，避免两个完整模型同时占用显存。
+    del baseline_model
+    if device == "cuda":
+        torch.cuda.empty_cache()
 
+    lora_base_model = AutoModelForCausalLM.from_pretrained(MODEL_NAME)
+    lora_model = PeftModel.from_pretrained(lora_base_model, str(LORA_PATH)).to(device)
+    lora_scores = benchmark(
+        lora_model, tokenizer, eval_dataset,
+        model_name="GPT-2 + LoRA", max_new_tokens=MAX_NEW_TOKENS,
+    )
+    # PeftModel 持有 base model；两个引用都释放后再加载全量微调模型。
+    del lora_model, lora_base_model
+    if device == "cuda":
+        torch.cuda.empty_cache()
 
-# ============================================================
-# 2. 加载 E2E
-# ============================================================
-
-dataset = load_dataset(
-    "GEM/e2e_nlg",
-    trust_remote_code=True,
-)
-
-eval_dataset = dataset[SPLIT].select(range(100))
-
-
-# ============================================================
-# 3. 逐条生成
-# ============================================================
-
-predictions = []
-references = []
-
-for i, sample in enumerate(eval_dataset):
-
-    mr = sample["meaning_representation"]
-    reference = sample["target"]
-
-    prompt = f"MR: {mr}\nText:"
-
-    inputs = tokenizer(
-        prompt,
-        return_tensors="pt",  # 结果直接返回成 PyTorch Tensor
-    ).to(device)
-
-    prompt_length = inputs["input_ids"].shape[1]
-
-    with torch.no_grad():
-        output = model.generate(
-            **inputs,
-            max_new_tokens=MAX_NEW_TOKENS,
-            do_sample=False,
-            pad_token_id=tokenizer.eos_token_id,
-        )
-
-    # 只保留新生成的部分
-    generated_ids = output[0][prompt_length:]
-
-    prediction = tokenizer.decode(
-        generated_ids,
-        skip_special_tokens=True,
-    ).strip()  # .strip()删开头结尾空白字符
-
-    predictions.append(prediction)
-    references.append(reference)
-
-    if (i + 1) % 100 == 0:
-        print(f"Generated {i + 1}/{len(eval_dataset)}")
-
-
-# ============================================================
-# 4. 转换成 pycocoevalcap 所需格式
-# ============================================================
-
-# 格式：
-# {
-#   0: ["reference sentence"],
-#   1: ["reference sentence"],
-# }
-#
-# prediction 同理，只不过每条只有一个生成结果
-
-gts = {i: [references[i]] for i in range(len(references))}
-
-res = {i: [predictions[i]] for i in range(len(predictions))}
-
-
-# ============================================================
-# 5. BLEU
-# ============================================================
-
-bleu_scorer = Bleu(4)
-# Bleu(n) = 计算从 BLEU-1 一直到 BLEU-n
-# BLEU-4 本身也不是“只看 4-gram”。标准 BLEU-4 通常是把 1、2、3、4-gram 的 precision 一起综合，再乘 brevity penalty（长度惩罚）。
-
-bleu_score, _ = bleu_scorer.compute_score(
-    gts,
-    res,
-)
-
-# bleu_score 会返回 BLEU-1 ~ BLEU-4
-bleu1, bleu2, bleu3, bleu4 = bleu_score
-
-
-# ============================================================
-# 6. ROUGE-L
-# ============================================================
-
-rouge_scorer = Rouge()
-
-rouge_l, _ = rouge_scorer.compute_score(
-    gts,
-    res,
-)
-
-
-# ============================================================
-# 7. CIDEr
-# ============================================================
-
-cider_scorer = Cider()
-
-cider, _ = cider_scorer.compute_score(
-    gts,
-    res,
-)
-
-
-# ============================================================
-# 8. NIST
-# ============================================================
-
-# NIST 需要：
-#
-# references:
-# [
-#   [["reference", "tokens"]],
-#   [["another", "reference"]],
-# ]
-#
-# hypotheses:
-# [
-#   ["generated", "tokens"],
-#   ["another", "generated"]
-# ]
-
-'''
-[
-    "The restaurant is good",
-    "It is near Raja"
-]
-⬇️
-[
-    [
-        ["The", "restaurant", "is", "good"]
-    ],
-    [
-        ["It", "is", "near", "Raja"]
-    ]
-]
-'''
-
-
-nist_references = [[reference.split()] for reference in references]
-
-nist_hypotheses = [prediction.split() for prediction in predictions]
-
-nist = corpus_nist(
-    nist_references,
-    nist_hypotheses,
-    n=5,
-)
-
-
-# ============================================================
-# 9. METEOR
-# ============================================================
-
-meteor_scores = []
-
-# for ... in zip() 多个可迭代对象一起遍历
-for reference, prediction in zip(
-    references,
-    predictions,
-):
-    score = meteor_score(
-        [reference.split()],
-        prediction.split(),
+    ft_tokenizer = AutoTokenizer.from_pretrained(str(FT_PATH))
+    ft_tokenizer.pad_token = ft_tokenizer.eos_token
+    ft_model = AutoModelForCausalLM.from_pretrained(str(FT_PATH)).to(device)
+    ft_scores = benchmark(
+        ft_model, ft_tokenizer, eval_dataset,
+        model_name="GPT-2 E2E Full FT", max_new_tokens=MAX_NEW_TOKENS,
     )
 
-    meteor_scores.append(score)
+    print(f"\nBenchmark ({SPLIT}, {len(eval_dataset)} samples)")
+    print(f"{'Metric':<10} {'GPT-2':>12} {'GPT-2 + LoRA':>14} {'GPT-2 Full FT':>16}")
+    print("-" * 55)
+    for metric, baseline_score in baseline_scores.items():
+        print(
+            f"{metric:<10} {baseline_score:>12.4f} "
+            f"{lora_scores[metric]:>14.4f} {ft_scores[metric]:>16.4f}"
+        )
 
-meteor = sum(meteor_scores) / len(meteor_scores)
 
-
-# ============================================================
-# 10. 输出结果
-# ============================================================
-
-print("\n===================================")
-print(f"Baseline GPT-2 Benchmark ({SPLIT})")
-print("===================================")
-
-print(f"BLEU-1   : {bleu1:.4f}")
-print(f"BLEU-2   : {bleu2:.4f}")
-print(f"BLEU-3   : {bleu3:.4f}")
-print(f"BLEU-4   : {bleu4:.4f}")
-
-print(f"NIST     : {nist:.4f}")
-print(f"METEOR   : {meteor:.4f}")
-print(f"ROUGE-L  : {rouge_l:.4f}")
-print(f"CIDEr    : {cider:.4f}")
+if __name__ == "__main__":
+    main()

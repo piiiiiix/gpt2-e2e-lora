@@ -11,6 +11,13 @@ ROUGE-L：这里的 L 是 Longest Common Subsequence（最长公共子序列）�
 CIDEr：先把 prediction 和 reference 都变成 TF-IDF 加权的 n-gram 向量，然后算余弦相似度。这个最有点“面向生成任务”的味道。它也是看 n-gram，但会给稀有、具有描述区分度的词组更高权重，而高频套话权重更低。最早大量用于 image captioning（图像描述），核心思想是：生成的描述是不是抓住了参考答案里真正有辨识度的信息，而不是只会说一些万能句。对 E2E 这种生成任务也挺合适。
 """
 
+import csv
+import gc
+import json
+import time
+import traceback
+from contextlib import redirect_stderr, redirect_stdout
+from datetime import datetime
 from pathlib import Path
 
 import nltk
@@ -52,15 +59,11 @@ def ensure_wordnet():
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-MODEL_NAME = "openai-community/gpt2"
-LORA_PATH = PROJECT_ROOT / "outputs/gpt2-e2e-lora/final/r4_attn_lr2e-4_best-eval_dirtest"
-FT_PATH = PROJECT_ROOT / "outputs/gpt2-e2e-full-ft/final"
 SPLIT = "validation"
-NUM_SAMPLES = 100
 MAX_NEW_TOKENS = 60
 
 
-def benchmark(model, tokenizer, eval_dataset, *, model_name="Model", max_new_tokens=60):
+def benchmark(model, tokenizer, eval_dataset, *, model_name="Model", max_new_tokens=60, predictions_path=None):
     """生成文本并计算指标，返回指标字典。"""
     if len(eval_dataset) == 0:
         raise ValueError("评测数据不能为空")
@@ -90,6 +93,13 @@ def benchmark(model, tokenizer, eval_dataset, *, model_name="Model", max_new_tok
         if (i + 1) % 100 == 0 or i + 1 == len(eval_dataset):
             print(f"[{model_name}] Generated {i + 1}/{len(eval_dataset)}", flush=True)
 
+    if predictions_path is not None:
+        with Path(predictions_path).open("w", encoding="utf-8") as stream:
+            for sample, prediction, reference in zip(eval_dataset, predictions, references):
+                stream.write(json.dumps({"meaning_representation": sample["meaning_representation"],
+                                         "prediction": prediction, "reference": reference},
+                                        ensure_ascii=False) + "\n")
+
     # pycocoevalcap 要求每条 reference/prediction 放在列表中。
     gts = {i: [reference] for i, reference in enumerate(references)}
     res = {i: [prediction] for i, prediction in enumerate(predictions)}
@@ -114,60 +124,137 @@ def benchmark(model, tokenizer, eval_dataset, *, model_name="Model", max_new_tok
     }
 
 
-def main():
-    if not (LORA_PATH / "adapter_config.json").is_file():
-        raise FileNotFoundError(f"找不到 LoRA adapter：{LORA_PATH}")
-    if not (FT_PATH / "config.json").is_file():
-        raise FileNotFoundError(f"找不到 full fine-tuning 模型：{FT_PATH}")
-    ensure_wordnet()
+class _Tee:
+    def __init__(self, console, log):
+        self.console, self.log = console, log
+
+    def write(self, text):
+        self.console.write(text)
+        self.log.write(text)
+
+    def flush(self):
+        self.console.flush()
+        self.log.flush()
+
+
+def run_benchmark(model_config, eval_dataset, output_dir, *, split=SPLIT,
+                  max_new_tokens=MAX_NEW_TOKENS):
+    """评测一个模型；配置含 name、type（base/lora/full）、path、可选 base_model。"""
+    import sys
+    config = dict(model_config)
+    kind = config.get("type")
+    if kind not in {"base", "lora", "full"}:
+        raise ValueError("模型 type 必须为 base、lora 或 full")
+    path = str(config["path"])
+    if kind in {"lora", "full"}:
+        local_path = Path(path)
+        if not local_path.is_absolute():
+            local_path = PROJECT_ROOT / local_path
+        required = "adapter_config.json" if kind == "lora" else "config.json"
+        if not (local_path / required).is_file():
+            raise FileNotFoundError(f"找不到模型文件：{local_path / required}")
+        path = str(local_path)
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    # GPT-2 和 LoRA 共用训练时保存的 tokenizer。
-    tokenizer = AutoTokenizer.from_pretrained(str(LORA_PATH))
-    tokenizer.pad_token = tokenizer.eos_token
-    dataset = load_dataset("GEM/e2e_nlg", trust_remote_code=True)
-    # 冒烟测试
-    # eval_dataset = dataset[SPLIT].select(range(min(NUM_SAMPLES, len(dataset[SPLIT]))))
+    model = None
+    started = time.perf_counter()
+    with (output_dir / "benchmark.log").open("w", encoding="utf-8") as log:  # noqa: SIM117
+        with redirect_stdout(_Tee(sys.stdout, log)), redirect_stderr(_Tee(sys.stderr, log)):
+            try:
+                print(f"Model: {config['name']}\nConfig: {config}\nSplit: {split}\nSamples: {len(eval_dataset)}\nDevice: {device}", flush=True)
+                tokenizer = AutoTokenizer.from_pretrained(path)
+                tokenizer.pad_token = tokenizer.eos_token
+                if kind == "lora":
+                    from peft import PeftConfig
+                    base_path = config.get("base_model") or PeftConfig.from_pretrained(path).base_model_name_or_path
+                    model = AutoModelForCausalLM.from_pretrained(base_path)
+                    model = PeftModel.from_pretrained(model, path).to(device)
+                else:
+                    model = AutoModelForCausalLM.from_pretrained(path).to(device)
+                scores = benchmark(model, tokenizer, eval_dataset, model_name=config["name"],
+                                   max_new_tokens=max_new_tokens,
+                                   predictions_path=output_dir / "predictions.jsonl")
+                result = {"name": config["name"], "config": {**config, "path": path},
+                          "split": split, "num_samples": len(eval_dataset), "device": device,
+                          "max_new_tokens": max_new_tokens, "do_sample": False,
+                          "elapsed_seconds": time.perf_counter() - started, "metrics": scores}
+                (output_dir / "metrics.json").write_text(
+                    json.dumps(result, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+                print(json.dumps(result, ensure_ascii=False, indent=2, default=str), flush=True)
+                return result
+            except Exception:
+                traceback.print_exc()
+                raise
+            finally:
+                del model
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
-    eval_dataset = dataset[SPLIT]
 
-    baseline_model = AutoModelForCausalLM.from_pretrained(MODEL_NAME).to(device)
-    baseline_scores = benchmark(
-        baseline_model, tokenizer, eval_dataset,
-        model_name="GPT-2", max_new_tokens=MAX_NEW_TOKENS,
-    )
-    # 先释放 baseline，避免两个完整模型同时占用显存。
-    del baseline_model
-    if device == "cuda":
-        torch.cuda.empty_cache()
+def save_model_chart(result, output_dir):
+    """单个模型的五项原始得分，共用同一组 XY 轴；BLEU 使用 BLEU-4。"""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    labels = ["BLEU", "NIST", "METEOR", "ROUGE-L", "CIDEr"]
+    keys = ["BLEU-4", "NIST", "METEOR", "ROUGE-L", "CIDEr"]
+    values = [result["metrics"][key] for key in keys]
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    fig, ax = plt.subplots(figsize=(9, 5))
+    bars = ax.bar(labels, values, color=plt.get_cmap("tab10").colors[:5])
+    ax.bar_label(bars, labels=[f"{value:.4g}" for value in values], padding=4)
+    ax.set_xlabel("Metric (BLEU = BLEU-4)")
+    ax.set_ylabel("Score (raw values)")
+    ax.set_ylim(0, max(max(values) * 1.2, 0.01))
+    ax.set_title(f"{result['name']} | {result['split']} | {result['num_samples']} samples")
+    ax.grid(axis="y", alpha=0.25)
+    ax.set_axisbelow(True)
+    fig.tight_layout()
+    try:
+        for extension in ("png", "svg"):
+            fig.savefig(output_dir / f"benchmark_scores.{extension}", dpi=180, bbox_inches="tight")
+    finally:
+        plt.close(fig)
 
-    lora_base_model = AutoModelForCausalLM.from_pretrained(MODEL_NAME)
-    lora_model = PeftModel.from_pretrained(lora_base_model, str(LORA_PATH)).to(device)
-    lora_scores = benchmark(
-        lora_model, tokenizer, eval_dataset,
-        model_name="GPT-2 + LoRA", max_new_tokens=MAX_NEW_TOKENS,
-    )
-    # PeftModel 持有 base model；两个引用都释放后再加载全量微调模型。
-    del lora_model, lora_base_model
-    if device == "cuda":
-        torch.cuda.empty_cache()
 
-    ft_tokenizer = AutoTokenizer.from_pretrained(str(FT_PATH))
-    ft_tokenizer.pad_token = ft_tokenizer.eos_token
-    ft_model = AutoModelForCausalLM.from_pretrained(str(FT_PATH)).to(device)
-    ft_scores = benchmark(
-        ft_model, ft_tokenizer, eval_dataset,
-        model_name="GPT-2 E2E Full FT", max_new_tokens=MAX_NEW_TOKENS,
-    )
-
-    print(f"\nBenchmark ({SPLIT}, {len(eval_dataset)} samples)")
-    print(f"{'Metric':<10} {'GPT-2':>12} {'GPT-2 + LoRA':>14} {'GPT-2 Full FT':>16}")
-    print("-" * 55)
-    for metric, baseline_score in baseline_scores.items():
-        print(
-            f"{metric:<10} {baseline_score:>12.4f} "
-            f"{lora_scores[metric]:>14.4f} {ft_scores[metric]:>16.4f}"
-        )
-
+def benchmark_model(model_config, *, split=SPLIT, num_samples=None,
+                    max_new_tokens=MAX_NEW_TOKENS, output_root=None):
+    """接收一个模型，评测并保存独立日志、指标和五项得分图。"""
+    if num_samples is not None and (isinstance(num_samples, bool) or not isinstance(num_samples, int) or num_samples <= 0):
+        raise ValueError("num_samples 必须为正整数或 None（完整 split）")
+    if isinstance(max_new_tokens, bool) or not isinstance(max_new_tokens, int) or max_new_tokens <= 0:
+        raise ValueError("max_new_tokens 必须为正整数")
+    import importlib.util
+    if importlib.util.find_spec("matplotlib") is None:
+        raise ImportError("生成图表需要 matplotlib，请在训练环境运行 pip install matplotlib")
+    dataset = load_dataset("GEM/e2e_nlg", trust_remote_code=True)[split]
+    if num_samples is not None:
+        dataset = dataset.select(range(min(num_samples, len(dataset))))
+    root = Path(output_root) if output_root is not None else PROJECT_ROOT / "outputs/benchmarks"
+    if not root.is_absolute():
+        root = PROJECT_ROOT / root
+    import re
+    name = re.sub(r"[^A-Za-z0-9_-]+", "_", model_config["name"]).strip("_") or "model"
+    run_dir = root / f"{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}_{name}"
+    run_dir.mkdir(parents=True, exist_ok=False)
+    (run_dir / "run_config.json").write_text(json.dumps(
+        {"model": model_config, "split": split, "num_samples": num_samples,
+         "max_new_tokens": max_new_tokens}, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+    result = run_benchmark(model_config, dataset, run_dir,
+                           split=split, max_new_tokens=max_new_tokens)
+    # metrics.json 保留模型路径、评测设置及全部原始指标，供以后生成模型对比图。
+    with (run_dir / "metrics.csv").open("w", encoding="utf-8-sig", newline="") as stream:
+        row = {"model": result["name"], "split": split, "samples": result["num_samples"],
+               "elapsed_seconds": result["elapsed_seconds"], **result["metrics"]}
+        writer = csv.DictWriter(stream, fieldnames=list(row))
+        writer.writeheader()
+        writer.writerow(row)
+    save_model_chart(result, run_dir)
+    print(f"{result['name']} 日志、指标和五项得分图已保存：{run_dir}", flush=True)
+    return run_dir
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit("请运行 src/00_benchmark_automation.py，在其中配置模型列表。")

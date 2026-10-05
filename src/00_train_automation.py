@@ -3,7 +3,7 @@
 import importlib.util
 from pathlib import Path
 
-R_VALUES = [4]
+R_VALUES = [1, 2, 4, 8, 16, 64]
 
 
 def main():

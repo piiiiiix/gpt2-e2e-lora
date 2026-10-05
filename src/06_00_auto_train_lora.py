@@ -19,8 +19,8 @@ from transformers import (
 
 MODEL_NAME = "openai-community/gpt2"
 OUTPUT_ROOT = Path(__file__).resolve().parents[1] / "outputs/gpt2-e2e-lora"
-SEEDS = (42, )
-# SEEDS = (42, 43, 44)
+# SEEDS = (42, )
+SEEDS = (42, 43, 44)
 
 
 def train_lora(R):

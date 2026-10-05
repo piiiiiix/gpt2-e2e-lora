@@ -1,6 +1,9 @@
+import gc
 import json
 import os
+from pathlib import Path
 
+import torch
 from datasets import load_dataset
 from transformers import (
     AutoModelForCausalLM,
@@ -8,9 +11,12 @@ from transformers import (
     DataCollatorForSeq2Seq,
     Trainer,
     TrainingArguments,
+    set_seed,
 )
 
 model_name = "openai-community/gpt2"
+OUTPUT_ROOT = Path(__file__).resolve().parents[1] / "outputs/gpt2-e2e-full-ft"
+SEEDS = (42, 43, 44)
 
 # 1. tokenizer
 tokenizer = AutoTokenizer.from_pretrained(model_name)
@@ -52,61 +58,74 @@ tokenized_dataset = dataset.map(
 train_dataset = tokenized_dataset["train"]
 eval_dataset = tokenized_dataset["validation"]
 
-# 直接加载完整 GPT-2
-# 不挂 LoRA，所以所有原始参数都会参与训练
-model = AutoModelForCausalLM.from_pretrained(model_name)
+for seed in SEEDS:
+    run_name = f"full_ft_seed{seed}"
+    print(f"\n===== Training {run_name} =====", flush=True)
+    # 直接加载完整 GPT-2
+    # 不挂 LoRA，所以所有原始参数都会参与训练
+    set_seed(seed)
+    model = AutoModelForCausalLM.from_pretrained(model_name)
 
-data_collator = DataCollatorForSeq2Seq(
-    tokenizer=tokenizer,
-    model=model,
-    padding=True,
-    label_pad_token_id=-100,
-)
-
-
-os.environ["TENSORBOARD_LOGGING_DIR"] = "outputs/gpt2-e2e-full-ft/tensorboard"
-
-
-training_args = TrainingArguments(
-    output_dir="outputs/gpt2-e2e-full-ft/checkpoints",
-    per_device_train_batch_size=8,
-    per_device_eval_batch_size=8,
-    learning_rate=2e-4,
-    num_train_epochs=3,
-    logging_steps=100,
-    eval_strategy="epoch",
-    save_strategy="epoch",
-    save_total_limit=2,
-    load_best_model_at_end=True,
-    metric_for_best_model="eval_loss",
-    greater_is_better=False,
-    report_to="tensorboard",
-    fp16=True,
-)
-
-trainer = Trainer(
-    model=model,
-    args=training_args,
-    train_dataset=train_dataset,
-    eval_dataset=eval_dataset,
-    data_collator=data_collator,
-)
-
-trainer.train()
-
-save_dir = "outputs/gpt2-e2e-full-ft/final"
-
-trainer.save_model(save_dir)
-tokenizer.save_pretrained(save_dir)
-
-# 11. 保存训练过程到日志
-log_path = os.path.join(save_dir, "train_log.json")
-with open(log_path, "w", encoding="utf-8") as f:
-    json.dump(
-        trainer.state.log_history,
-        f,
-        ensure_ascii=False,
-        indent=2,
+    data_collator = DataCollatorForSeq2Seq(
+        tokenizer=tokenizer,
+        model=model,
+        padding=True,
+        label_pad_token_id=-100,
     )
 
-print(f"Training log saved to: {log_path}")
+
+    os.environ["TENSORBOARD_LOGGING_DIR"] = str(OUTPUT_ROOT / "tensorboard" / f"seed{seed}")
+
+
+    training_args = TrainingArguments(
+        output_dir=str(OUTPUT_ROOT / "checkpoints" / f"seed{seed}"),
+        run_name=run_name,
+        per_device_train_batch_size=8,
+        per_device_eval_batch_size=8,
+        learning_rate=2e-4,
+        num_train_epochs=3,
+        logging_steps=100,
+        eval_strategy="epoch",
+        save_strategy="epoch",
+        save_total_limit=2,
+        load_best_model_at_end=True,
+        metric_for_best_model="eval_loss",
+        greater_is_better=False,
+        report_to="tensorboard",
+        fp16=torch.cuda.is_available(),
+        seed=seed,
+        data_seed=seed,
+    )
+
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=train_dataset,
+        eval_dataset=eval_dataset,
+        data_collator=data_collator,
+    )
+
+    try:
+        trainer.train()
+
+        save_dir = OUTPUT_ROOT / "final" / f"seed{seed}"
+
+        trainer.save_model(str(save_dir))
+        tokenizer.save_pretrained(str(save_dir))
+
+        # 11. 保存训练过程到日志
+        log_path = os.path.join(save_dir, "train_log.json")
+        with open(log_path, "w", encoding="utf-8") as f:
+            json.dump(
+                trainer.state.log_history,
+                f,
+                ensure_ascii=False,
+                indent=2,
+            )
+
+        print(f"Training log saved to: {log_path}")
+    finally:
+        del trainer, data_collator, model
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()

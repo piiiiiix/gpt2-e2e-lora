@@ -238,7 +238,7 @@ def benchmark_model(model_config, *, split=SPLIT, num_samples=None,
         root = PROJECT_ROOT / root
     import re
     name = re.sub(r"[^A-Za-z0-9_-]+", "_", model_config["name"]).strip("_") or "model"
-    run_dir = root / f"{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}_{name}"
+    run_dir = root / f"{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}_{name}"  # noqa: DTZ005
     run_dir.mkdir(parents=True, exist_ok=False)
     (run_dir / "run_config.json").write_text(json.dumps(
         {"model": model_config, "split": split, "num_samples": num_samples,

@@ -14,8 +14,8 @@ RUN_ALL = False          # 打开后覆盖下面三个类别开关及 LORA_RANKS
 RUN_LORA = False
 LORA_RANKS = (8,)        # 单个秩写 (8,)，多个写 (1, 2, 4, 8, 16, 64)
                         # None = 所有已保存的 LoRA 秩（跳过不存在的秩）
-RUN_FFT = False          # 所有已保存的 FFT seed
-RUN_GPT2 = True          # 原生 GPT-2 只跑一次，不需要三个训练 seed
+RUN_FFT = True          # 所有已保存的 FFT seed
+RUN_GPT2 = False          # 原生 GPT-2 只跑一次，不需要三个训练 seed
 
 LORA_MODEL_ROOT = PROJECT_ROOT / "outputs/gpt2-e2e-lora/final"
 FFT_MODEL_ROOT = PROJECT_ROOT / "outputs/gpt2-e2e-full-ft/final"

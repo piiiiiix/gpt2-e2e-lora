@@ -2,12 +2,13 @@
 import argparse
 import gc
 import json
-import os
+from datetime import datetime
 from pathlib import Path
 
 import torch
 from datasets import load_dataset
 from peft import LoraConfig, get_peft_model
+from torch.utils.tensorboard import SummaryWriter
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
@@ -16,6 +17,7 @@ from transformers import (
     TrainingArguments,
     set_seed,
 )
+from transformers.integrations import TensorBoardCallback
 
 MODEL_NAME = "openai-community/gpt2"
 OUTPUT_ROOT = Path(__file__).resolve().parents[1] / "outputs/gpt2-e2e-lora"
@@ -46,8 +48,14 @@ def train_lora(R):
     )
     saved_paths = []
     for seed in SEEDS:
-        run_name = f"r{R}_seed{seed}"
-        save_dir = OUTPUT_ROOT / "final" / f"r{R}" / f"seed{seed}"
+        run_id = f"{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}_seed{seed}"
+        run_name = f"r{R}_{run_id}"
+        save_dir = OUTPUT_ROOT / "final" / f"r{R}" / run_id
+        checkpoint_dir = OUTPUT_ROOT / "checkpoints" / f"r{R}" / run_id
+        tensorboard_dir = OUTPUT_ROOT / "tensorboard" / f"r{R}" / run_id
+        # 同参数重训也使用独立目录；目录重名时停止，避免覆盖已有结果。
+        for run_dir in (save_dir, checkpoint_dir, tensorboard_dir):
+            run_dir.mkdir(parents=True, exist_ok=False)
         print(f"\n===== Training {run_name} =====", flush=True)
         # 必须先设置 seed，再创建模型和随机初始化的 LoRA 权重。
         set_seed(seed)
@@ -60,11 +68,8 @@ def train_lora(R):
         data_collator = DataCollatorForSeq2Seq(
             tokenizer=tokenizer, model=model, padding=True, label_pad_token_id=-100,
         )
-        # TensorBoard callback 从环境变量读取每次训练的独立日志路径。
-        tensorboard_dir = OUTPUT_ROOT / "tensorboard" / f"r{R}" / f"seed{seed}"
-        os.environ["TENSORBOARD_LOGGING_DIR"] = str(tensorboard_dir)
         training_args = TrainingArguments(
-            output_dir=str(OUTPUT_ROOT / "checkpoints" / f"r{R}" / f"seed{seed}"),
+            output_dir=str(checkpoint_dir),
             run_name=run_name,
             per_device_train_batch_size=8,
             per_device_eval_batch_size=8,
@@ -77,16 +82,19 @@ def train_lora(R):
             load_best_model_at_end=True,
             metric_for_best_model="eval_loss",
             greater_is_better=False,
-            report_to="tensorboard",
+            report_to="none",
             fp16=torch.cuda.is_available(),
             seed=seed,
             data_seed=seed,
         )
+        # 显式绑定本次训练目录，避免自动 callback 使用默认或共享日志路径。
+        tb_writer = SummaryWriter(log_dir=str(tensorboard_dir))
         trainer = Trainer(
             model=model, args=training_args,
             train_dataset=tokenized_dataset["train"],
             eval_dataset=tokenized_dataset["validation"],
             data_collator=data_collator,
+            callbacks=[TensorBoardCallback(tb_writer=tb_writer)],
         )
         try:
             trainer.train()
@@ -97,6 +105,7 @@ def train_lora(R):
             saved_paths.append(save_dir)
             print(f"Saved {run_name}: {save_dir}", flush=True)
         finally:
+            tb_writer.close()
             # Trainer 和 collator 也持有模型引用。
             del trainer, data_collator, model
             gc.collect()

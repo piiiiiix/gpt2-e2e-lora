@@ -1,10 +1,12 @@
 import gc
 import json
 import os
+from datetime import datetime
 from pathlib import Path
 
 import torch
 from datasets import load_dataset
+from torch.utils.tensorboard import SummaryWriter
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
@@ -13,6 +15,7 @@ from transformers import (
     TrainingArguments,
     set_seed,
 )
+from transformers.integrations import TensorBoardCallback
 
 model_name = "openai-community/gpt2"
 OUTPUT_ROOT = Path(__file__).resolve().parents[1] / "outputs/gpt2-e2e-full-ft"
@@ -59,7 +62,14 @@ train_dataset = tokenized_dataset["train"]
 eval_dataset = tokenized_dataset["validation"]
 
 for seed in SEEDS:
-    run_name = f"full_ft_seed{seed}"
+    run_id = f"{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}_seed{seed}"
+    run_name = f"full_ft_{run_id}"
+    save_dir = OUTPUT_ROOT / "final" / run_id
+    checkpoint_dir = OUTPUT_ROOT / "checkpoints" / run_id
+    tensorboard_dir = OUTPUT_ROOT / "tensorboard" / run_id
+    # 同参数重训使用独立目录，重名时停止以避免覆盖。
+    for run_dir in (save_dir, checkpoint_dir, tensorboard_dir):
+        run_dir.mkdir(parents=True, exist_ok=False)
     print(f"\n===== Training {run_name} =====", flush=True)
     # 直接加载完整 GPT-2
     # 不挂 LoRA，所以所有原始参数都会参与训练
@@ -74,11 +84,8 @@ for seed in SEEDS:
     )
 
 
-    os.environ["TENSORBOARD_LOGGING_DIR"] = str(OUTPUT_ROOT / "tensorboard" / f"seed{seed}")
-
-
     training_args = TrainingArguments(
-        output_dir=str(OUTPUT_ROOT / "checkpoints" / f"seed{seed}"),
+        output_dir=str(checkpoint_dir),
         run_name=run_name,
         per_device_train_batch_size=8,
         per_device_eval_batch_size=8,
@@ -91,24 +98,25 @@ for seed in SEEDS:
         load_best_model_at_end=True,
         metric_for_best_model="eval_loss",
         greater_is_better=False,
-        report_to="tensorboard",
+        report_to="none",
         fp16=torch.cuda.is_available(),
         seed=seed,
         data_seed=seed,
     )
 
+    # 显式绑定本次训练目录，避免自动 callback 使用默认或共享日志路径。
+    tb_writer = SummaryWriter(log_dir=str(tensorboard_dir))
     trainer = Trainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         data_collator=data_collator,
+        callbacks=[TensorBoardCallback(tb_writer=tb_writer)],
     )
 
     try:
         trainer.train()
-
-        save_dir = OUTPUT_ROOT / "final" / f"seed{seed}"
 
         trainer.save_model(str(save_dir))
         tokenizer.save_pretrained(str(save_dir))
@@ -125,6 +133,7 @@ for seed in SEEDS:
 
         print(f"Training log saved to: {log_path}")
     finally:
+        tb_writer.close()
         del trainer, data_collator, model
         gc.collect()
         if torch.cuda.is_available():

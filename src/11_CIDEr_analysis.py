@@ -1,3 +1,9 @@
+import csv
+import gc
+import json
+from datetime import datetime
+from pathlib import Path
+
 '''python -m streamlit run src/11_CIDEr_analysis.py'''
 
 """FFT 逐样本 CIDEr 分布页面。
@@ -7,12 +13,6 @@
 评分口径与 08_benchmark.py 相同：每条数据的 target 为单个参考答案，
 不额外分词；在整个选定 split 上计算 CIDEr 的文档频率，再取逐样本分数。
 """
-
-import csv
-import gc
-import json
-from datetime import datetime
-from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 MODEL_ROOT = PROJECT_ROOT / "outputs/gpt2-e2e-full-ft/final"

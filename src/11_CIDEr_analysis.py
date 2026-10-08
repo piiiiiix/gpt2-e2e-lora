@@ -1,3 +1,5 @@
+'''python -m streamlit run src/11_CIDEr_analysis.py'''
+
 """FFT 逐样本 CIDEr 分布页面。
 
 启动：python -m streamlit run src/10_CIDEr_analysis.py

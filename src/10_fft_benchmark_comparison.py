@@ -1,3 +1,5 @@
+'''python -m streamlit run src/11_CIDEr_analysis.py'''
+
 """Render the six FFT runs, relative differences, and descriptive variability."""
 import csv
 import itertools
@@ -5,6 +7,7 @@ import statistics
 from pathlib import Path
 
 import matplotlib
+
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 

@@ -3,8 +3,17 @@ __pycache__/
 nltk_data/
 *.pyc
 
-outputs/*
-!outputs/.gitkeep
+# 忽略 outputs 下所有文件
+/outputs/**
+
+# 允许 Git 遍历子目录
+!/outputs/**/
+
+# 只允许 tokenizer.json
+!/outputs/**/tokenizer.json
+
+# 保留空目录占位文件
+!/outputs/.gitkeep
 
 checkpoints/
 *.pt
